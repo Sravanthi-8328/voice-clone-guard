@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Project specifics
+uploads/*
+!uploads/.gitkeep
+logs/*
+!logs/.gitkeep
+models/*.pt
+!models/.gitkeep
+
+# IDEs
+.vscode/
+.idea/
