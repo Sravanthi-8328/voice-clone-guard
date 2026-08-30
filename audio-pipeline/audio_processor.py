@@ -1,72 +1,83 @@
+import numpy as np
 import torch
 import torchaudio
-import numpy as np
+import soundfile as sf
 
-def preprocess_audio(file_path: str, target_sr: int = 16000, n_mels: int = 64, target_frames: int = 128) -> np.ndarray:
-    """
-    Loads an audio file, resamples to 16kHz, converts to mono, normalizes amplitude,
-    generates a Mel-Spectrogram matrix, and pads/crops time frames to 128 width.
-    """
-    wav, sr = torchaudio.load(file_path)
-    
-    # Resample if needed
-    if sr != target_sr:
-        wav = torchaudio.functional.resample(wav, sr, target_sr)
-        
-    # Convert to mono & normalize
-    wav = wav.mean(dim=0, keepdim=True)
-    wav = wav / (wav.abs().max() + 1e-9)
-    
-    # Compute Mel Spectrogram (in dB)
-    mel_spec = torchaudio.transforms.MelSpectrogram(
-        sample_rate=target_sr, n_fft=1024, hop_length=256, n_mels=n_mels
-    )(wav)
-    mel_db = torchaudio.transforms.AmplitudeToDB()(mel_spec)
-    mel = mel_db.squeeze(0).numpy()
-    
-    # Pad or crop to target_frames (128)
-    _, T = mel.shape
-    if T < target_frames:
-        mel = np.pad(mel, ((0, 0), (0, target_frames - T)), mode="constant")
-    elif T > target_frames:
-        mel = mel[:, :target_frames]
-        
+
+def _load_audio(file_path: str):
+    try:
+        audio, sr = sf.read(file_path, dtype="float32", always_2d=False)
+        if audio is None or audio.size == 0:
+            raise ValueError("Audio file is empty")
+        if isinstance(audio, np.ndarray) and audio.ndim == 2:
+            audio = audio.mean(axis=1)
+        return torch.from_numpy(np.asarray(audio, dtype=np.float32)), sr
+    except Exception:
+        audio, sr = torchaudio.load(file_path)
+        audio = audio.float()
+        if audio.ndim > 1:
+            audio = audio.mean(dim=0)
+        return audio, sr
+
+
+def _standardize_mel(mel: np.ndarray):
+    mel_mean = np.mean(mel)
+    mel_std = np.std(mel)
+    mel = (mel - mel_mean) / (mel_std + 1e-8)
     return mel.astype(np.float32)
 
 
-def extract_features(wav_tensor, sr: int = 16000) -> dict:
-    """
-    Extracts DSP acoustic metrics: RMS energy, silence ratio,
-    spectral centroid, spectral spread, and 13 MFCCs.
-    """
-    wav = wav_tensor.cpu().numpy() if hasattr(wav_tensor, "cpu") else wav_tensor
-    duration = len(wav) / sr
+def preprocess_audio(
+    file_path: str,
+    target_sr: int = 16000,
+    n_mels: int = 64,
+    target_frames: int = 256,
+    max_chunks: int = 3,
+) -> np.ndarray:
+    wav, sr = _load_audio(file_path)
 
-    # RMS Energy & Silence Ratio
-    rms = np.sqrt(np.mean(wav**2) + 1e-12)
-    rms_db = 20 * np.log10(rms + 1e-12)
-    silence_ratio = float(np.mean(np.abs(wav) < (10 ** (-40 / 20))))
+    if wav.numel() == 0:
+        raise ValueError(f"No usable waveform found in {file_path}")
 
-    # Frequency Spectrum Metrics
-    spec = np.abs(np.fft.rfft(wav, n=2048)) + 1e-9
-    freqs = np.fft.rfftfreq(2048, d=1.0 / sr)
-    spec_norm = spec / spec.sum()
+    wav = wav.unsqueeze(0)
 
-    centroid_hz = float((freqs * spec_norm).sum())
-    spread_hz = float(np.sqrt(((freqs - centroid_hz) ** 2 * spec_norm).sum()))
+    if sr != target_sr:
+        wav = torchaudio.functional.resample(wav, sr, target_sr)
 
-    # MFCC Extraction (13 coefficients)
-    mfcc_transform = torchaudio.transforms.MFCC(
-        sample_rate=sr, n_mfcc=13, melkwargs={"n_fft": 1024, "hop_length": 256, "n_mels": 64}
-    )
-    mfcc = mfcc_transform(torch.from_numpy(wav).unsqueeze(0)).squeeze(0).numpy()
+    max_value = wav.abs().max()
+    if max_value > 0:
+        wav = wav / max_value
 
-    return {
-        "duration_sec": round(duration, 3),
-        "rms_db": round(rms_db, 2),
-        "silence_ratio": round(silence_ratio, 3),
-        "spectral_centroid_hz": round(centroid_hz, 1),
-        "spectral_spread_hz": round(spread_hz, 1),
-        "mfcc_mean": [round(v, 3) for v in np.mean(mfcc, axis=1)],
-        "mfcc_std": [round(v, 3) for v in np.std(mfcc, axis=1)],
-    }
+    chunk_size = max(1, wav.shape[-1] // max_chunks)
+    chunk_mels = []
+
+    for start in range(0, wav.shape[-1], chunk_size):
+        chunk = wav[:, start:start + chunk_size]
+        if chunk.shape[-1] < 160:
+            continue
+
+        mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=target_sr,
+            n_fft=1024,
+            hop_length=256,
+            n_mels=n_mels,
+        )
+        mel_spec = mel_transform(chunk)
+        mel_db = torchaudio.transforms.AmplitudeToDB(stype="power")(mel_spec)
+        mel = mel_db.squeeze(0).numpy()
+        mel = _standardize_mel(mel)
+
+        _, time_steps = mel.shape
+        if time_steps < target_frames:
+            mel = np.pad(mel, ((0, 0), (0, target_frames - time_steps)), mode="constant")
+        elif time_steps > target_frames:
+            start_index = (time_steps - target_frames) // 2
+            mel = mel[:, start_index:start_index + target_frames]
+
+        chunk_mels.append(mel)
+
+    if not chunk_mels:
+        raise ValueError(f"Unable to derive mel features from {file_path}")
+
+    aggregated = np.mean(np.stack(chunk_mels, axis=0), axis=0)
+    return aggregated.astype(np.float32)
